@@ -9,8 +9,8 @@ import uuid
 from datetime import datetime
 import json
 from threading import Thread
-# 导入我们新的“引擎”
-from processor import translate_book_processing
+# 导入我们修复后的“引擎”
+from processor import translate_book_processing, helsinki_translate
 
 # --- 页面基础配置 ---
 st.set_page_config(page_title="云端电子书翻译工坊", page_icon="📚", layout="wide")
@@ -32,15 +32,15 @@ DB_FILE = Path("tasks_db.json")
 def load_tasks():
     if DB_FILE.exists():
         try:
-            with open(DB_FILE, "r") as f:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except json.JSONDecodeError:
-            return {} # 如果文件损坏，返回空字典
+        except (json.JSONDecodeError, IOError):
+            return {} # 如果文件损坏或无法读取，返回空字典
     return {}
 
 def save_tasks(tasks):
-    with open(DB_FILE, "w") as f:
-        json.dump(tasks, f, indent=2)
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2, ensure_ascii=False)
 
 st.session_state.tasks = load_tasks()
 
@@ -48,18 +48,37 @@ st.session_state.tasks = load_tasks()
 def run_real_translation(task_id, input_file_path, engine_id, api_key, language, options):
     tasks = load_tasks()
     try:
-        if task_id not in tasks: return # 如果任务被用户删除了，则中止
+        if task_id not in tasks: return # 任务已被删除
         tasks[task_id]["status"] = "🏃‍♂️ 翻译中..."
         save_tasks(tasks)
 
-        # 调用我们真正的翻译引擎
-        output_file = translate_book_processing(
-            input_file_path,
-            engine_id,
-            api_key,
-            language,
-            **options
-        )
+        # 区分本地模型和API模型
+        if engine_id == "local_helsinki":
+            # 本地模型逻辑
+            direction = options.get("direction", "英文 -> 简体中文")
+            model_name = "Helsinki-NLP/opus-mt-en-zh" if "en-zh" in direction else "Helsinki-NLP/opus-mt-zh-en"
+
+            with open(input_file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # TODO: 实现分段翻译逻辑
+            translated_content = helsinki_translate(content, language, model_name)
+            
+            name, ext = os.path.splitext(input_file_path)
+            output_file_path = f"{name}_bilingual{ext}"
+            with open(output_file_path, "w", encoding="utf-8") as f:
+                f.write(content + "\n\n--- Translation ---\n\n" + translated_content)
+            
+            output_file = output_file_path
+        else:
+            # 调用原始库的API模型逻辑
+            output_file = translate_book_processing(
+                input_file_path,
+                engine_id,
+                api_key,
+                language,
+                **options
+            )
         
         # 翻译成功
         tasks = load_tasks()
@@ -75,7 +94,7 @@ def run_real_translation(task_id, input_file_path, engine_id, api_key, language,
         if task_id in tasks:
             tasks[task_id]["status"] = f"❌ 失败: {str(e)[:150]}..."
             save_tasks(tasks)
-        st.error(f"任务 {task_id} 失败: {e}") # 在主界面也给出一个提示
+        st.error(f"任务 {task_id} 失败: {e}")
 
 
 def cleanup_old_tasks():
@@ -85,8 +104,7 @@ def cleanup_old_tasks():
     
     for task_id, task_info in tasks.items():
         task_time = datetime.fromisoformat(task_info["created_at"])
-        # 清理超过24小时的所有任务
-        if (now - task_time).total_seconds() > 86400:
+        if (now - task_time).total_seconds() > 86400: # 24 hours
             tasks_to_delete.append(task_id)
 
     if tasks_to_delete:
@@ -107,7 +125,6 @@ def cleanup_old_tasks():
     else:
         st.toast("没有需要清理的过期任务。")
 
-
 # ===================================================================
 # ---                         前端界面部分 (驾驶舱)                   ---
 # ===================================================================
@@ -120,9 +137,10 @@ def check_password():
     st.header("🔑 请输入访问密码")
     password = st.text_input("密码", type="password")
     
-    correct_password = st.secrets.get("APP_PASSWORD", "DEFAULT_PASSWORD")
-    if correct_password == "DEFAULT_PASSWORD":
+    correct_password = st.secrets.get("APP_PASSWORD")
+    if not correct_password:
         st.warning("警告：应用未设置安全密码，请联系管理员在Secrets中设置 APP_PASSWORD。")
+        return False
 
     if password and password == correct_password:
         st.session_state.password_correct = True
@@ -130,6 +148,7 @@ def check_password():
     elif password:
         st.error("密码错误！")
     
+    st.stop() # 如果密码不正确，停止执行后续代码
     return False
 
 # --- 主应用UI ---
@@ -140,6 +159,7 @@ def main_app():
 
         # 1. 翻译引擎选择
         engine_options = {
+            "免费本地模型 (中英互译)": "local_helsinki",
             "ChatGPT API (gpt-3.5-turbo)": "chatgptapi",
             "DeepL (API)": "deepl",
             "DeepL Free": "deeplfree",
@@ -149,18 +169,14 @@ def main_app():
             "Qwen (API)": "qwen-mt-turbo",
             "腾讯交互翻译": "tencentransmart",
             "Ollama (本地)": "ollama",
-            "免费本地模型 (中英互译)": "local_helsinki", # 这是一个占位符，需要后端实现
         }
-        selected_engine_name = st.selectbox("选择翻译引擎", options=engine_options.keys())
+        selected_engine_name = st.selectbox("选择翻译引擎", options=list(engine_options.keys()))
         selected_engine_id = engine_options[selected_engine_name]
 
-        # 2. API 密钥输入 (动态显示)
-        # 优先从Secrets读取，其次接受用户输入
+        # 2. API 密钥输入
         api_key_mapping = {
-            "chatgptapi": "OPENAI_API_KEY",
-            "deepl": "DEEPL_API_KEY",
-            "claude": "CLAUDE_API_KEY",
-            "gemini": "GEMINI_API_KEY",
+            "chatgptapi": "OPENAI_API_KEY", "deepl": "DEEPL_API_KEY",
+            "claude": "CLAUDE_API_KEY", "gemini": "GEMINI_API_KEY",
             "qwen-mt-turbo": "QWEN_API_KEY",
         }
         api_key_secret_name = api_key_mapping.get(selected_engine_id)
@@ -174,19 +190,23 @@ def main_app():
                 api_key = st.text_input(f"输入 {selected_engine_name} 的 API Key", type="password", help=f"或在应用Secrets中设置名为 {api_key_secret_name} 的密钥。")
         
         # 3. 目标语言
-        language = st.selectbox(
-            "选择目标语言",
-            ["simplified chinese", "traditional chinese", "english", "japanese", "korean", "french", "german", "spanish"],
-            index=0 # 默认选择简体中文
-        )
+        direction = None
+        if selected_engine_id == "local_helsinki":
+            direction = st.selectbox("选择翻译方向", ["英文 -> 简体中文", "简体中文 -> 英文"])
+            language = "simplified chinese" if "中文" in direction else "english"
+        else:
+            language = st.selectbox(
+                "选择目标语言",
+                ["simplified chinese", "traditional chinese", "english", "japanese", "korean", "french", "german", "spanish"],
+                index=0
+            )
 
         # 4. 高级选项
         with st.expander("高级选项"):
-            prompt = st.text_area("自定义 Prompt (可选)", help="输入完整的Prompt模板，必须包含 {text} 和 {language} 占位符。")
+            prompt = st.text_area("自定义 Prompt (可选)", help="输入完整的Prompt模板。")
             proxy = st.text_input("代理服务器地址 (可选)", placeholder="例如: http://127.0.0.1:7890")
-            test_mode = st.checkbox("开启测试模式", value=False, help="仅翻译书本的前10个段落，用于快速验证。")
-            translate_tags = st.text_input("要翻译的HTML标签 (EPUB)", value="p,h1,h2,h3,div", help="用逗号分隔，例如 p,h1,h2,h3,div")
-
+            test_mode = st.checkbox("开启测试模式", value=False, help="仅翻译书本的前10个段落。")
+            translate_tags = st.text_input("要翻译的HTML标签 (EPUB)", value="p,h1,h2,h3,div", help="用逗号分隔。")
 
     # --- 主面板：任务提交与列表 ---
     st.header("1. 提交新翻译任务")
@@ -199,39 +219,32 @@ def main_app():
         if api_key_secret_name and not api_key:
             st.error(f"请在左侧输入 {selected_engine_name} 的 API Key！")
         else:
-            # 将上传的文件保存到服务器的持久化存储区
             input_file_path = Path(uploaded_file.name)
             with open(input_file_path, "wb") as f:
                 f.write(uploaded_file.getvalue())
             
             task_id = str(uuid.uuid4())
             
-            # 【关键】收集所有配置并打包
             prompt_config = None
             if prompt:
                 try:
-                    # 尝试解析为JSON，如果失败则视为纯文本
                     prompt_config = json.loads(prompt)
                 except json.JSONDecodeError:
                     prompt_config = {"user": prompt}
 
             options = {
-                "is_test": test_mode,
-                "test_num": 10,
+                "is_test": test_mode, "test_num": 10,
                 "proxy": proxy if proxy else None,
                 "prompt_config": prompt_config,
-                "translate_tags": translate_tags
+                "translate_tags": translate_tags,
+                "direction": direction, # 传递本地模型翻译方向
             }
             
             new_task = {
-                "id": task_id,
-                "file_name": uploaded_file.name,
-                "engine": selected_engine_name,
-                "status": "⌛ 排队中...",
-                "progress": 0.0,
-                "created_at": datetime.now().isoformat(),
-                "result_file": None,
-                "input_file": str(input_file_path)
+                "id": task_id, "file_name": uploaded_file.name,
+                "engine": selected_engine_name, "status": "⌛ 排队中...",
+                "progress": 0.0, "created_at": datetime.now().isoformat(),
+                "result_file": None, "input_file": str(input_file_path)
             }
             tasks = load_tasks()
             tasks[task_id] = new_task
@@ -239,7 +252,6 @@ def main_app():
             
             st.info(f"任务 {task_id} 已提交！将在后台开始处理。请在下方列表查看进度。")
             
-            # 使用线程在后台运行【真实】的翻译任务
             thread = Thread(target=run_real_translation, args=(
                 task_id, str(input_file_path), selected_engine_id, api_key, language, options
             ))
@@ -258,7 +270,6 @@ def main_app():
         cleanup_old_tasks()
         st.rerun()
 
-    # 显示任务列表
     tasks_container = st.container()
     tasks = load_tasks()
     if not tasks:
@@ -270,10 +281,6 @@ def main_app():
             with tasks_container.expander(f"任务ID: {task['id']} - **{task['file_name']}** ({task['status']})"):
                 st.write(f"**翻译引擎**: {task['engine']}")
                 st.write(f"**提交时间**: {task['created_at']}")
-                if "翻译中" in task['status']:
-                    # 这是一个模拟的进度条，真实进度需要后端传递
-                    # st.progress(task['progress'], text=task['status'])
-                    st.info(task['status']) # 暂时只显示状态
                 
                 if task["status"] == "✅ 已完成":
                     try:
@@ -286,6 +293,10 @@ def main_app():
                             )
                     except FileNotFoundError:
                         st.error("结果文件未找到，可能已被清理或任务失败。")
+
+    # 简单的自动刷新
+    # time.sleep(15)
+    # st.rerun()
 
 # --- 应用入口 ---
 if check_password():
