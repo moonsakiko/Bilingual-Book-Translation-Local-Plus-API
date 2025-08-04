@@ -1,2 +1,6 @@
 libxml2-dev
 libxslt-dev
+
+cmake
+pkg-config
+build-essential
