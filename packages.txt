@@ -1,4 +1,2 @@
-# 文件名: packages.txt
-
 libxml2-dev
 libxslt-dev
