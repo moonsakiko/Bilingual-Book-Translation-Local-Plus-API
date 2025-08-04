@@ -1,0 +1,31 @@
+# 文件名: requirements.txt
+
+# --- Streamlit 核心 ---
+streamlit
+
+# --- 文件处理 ---
+ebooklib
+beautifulsoup4
+lxml
+
+# --- API 调用 ---
+requests
+openai>=1.1.1
+anthropic
+google-generativeai
+groq>=0.5.0
+PyDeepLX
+
+# --- 本地 AI 模型 ---
+transformers
+torch
+sentencepiece
+safetensors
+
+# --- 其他工具 ---
+backoff
+rich
+tqdm
+tiktoken
+langdetect
+promptdown>=0.9.0

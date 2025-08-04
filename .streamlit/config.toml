@@ -1,0 +1,9 @@
+# 文件名: .streamlit/config.toml
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
